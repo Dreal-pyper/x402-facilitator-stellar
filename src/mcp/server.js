@@ -1,4 +1,7 @@
 import { createInterface } from 'readline';
+import { getPrompt, listPrompts } from './prompts.js';
+import { McpInputError } from './sanitize.js';
+import { listResourceTemplates, listResources, readResource } from './resources.js';
 
 /**
  * Minimal MCP Stdio Server.
@@ -20,12 +23,40 @@ import { createInterface } from 'readline';
  *     batch (a JSON array) is rejected with -32600 — the MCP protocol does not
  *     support JSON-RPC batching — and anything that is not an object with a
  *     string `method` gets -32600 rather than the silence a client times out on.
+ *
+ * Beyond `tools/*` the server also speaks the `prompts/*` and `resources/*`
+ * halves of MCP (#391). Both follow the same two-tier error contract as tools,
+ * so they share `_sendSemanticError` rather than growing their own.
  */
 export class McpServer {
-  constructor({ name, version, logger = console } = {}) {
+  /**
+   * @param {object} options
+   * @param {string} options.name
+   * @param {string} options.version
+   * @param {object} [options.logger=console]
+   * @param {(path: string, params?: object) => Promise<object>} [options.fetchDiscovery]
+   *   facilitator HTTP helper, required to serve `resources/read` (#391). The
+   *   semantic resources are URIs into the catalog, so without a way to reach
+   *   the catalog they are advertised but not readable — the capability is
+   *   omitted from `initialize` in that case rather than advertised and failing
+   *   on first use.
+   * @param {boolean} [options.prompts=true] - serve `prompts/*` (#391)
+   * @param {boolean} [options.resources=true] - serve `resources/*` (#391)
+   */
+  constructor({
+    name,
+    version,
+    logger = console,
+    fetchDiscovery = null,
+    prompts = true,
+    resources = true,
+  } = {}) {
     this.name = name;
     this.version = version;
     this.logger = logger;
+    this.fetchDiscovery = fetchDiscovery;
+    this.promptsEnabled = prompts;
+    this.resourcesEnabled = resources && typeof fetchDiscovery === 'function';
     this.tools = new Map();
     // Stdio wiring, filled in by start(); overridable for tests.
     this._stdout = null;
@@ -152,10 +183,16 @@ export class McpServer {
 
   async _handleRequest(req) {
     if (req.method === 'initialize') {
+      // Capabilities advertise only what this instance can actually serve: a
+      // client that sees `resources` will call `resources/read`, and a server
+      // with no catalog connection could only answer that with an error.
+      const capabilities = { tools: {} };
+      if (this.promptsEnabled) capabilities.prompts = {};
+      if (this.resourcesEnabled) capabilities.resources = {};
       this._sendResult(req.id, {
         protocolVersion: '2024-11-05',
         serverInfo: { name: this.name, version: this.version },
-        capabilities: { tools: {} },
+        capabilities,
       });
     } else if (req.method === 'tools/list') {
       const tools = Array.from(this.tools.entries()).map(([name, { schema }]) => ({
@@ -219,6 +256,8 @@ export class McpServer {
       this._sendResult(req.id, {});
     } else if (req.method === 'notifications/initialized') {
       // no response needed
+    } else if (await this._handleSemantic(req)) {
+      // prompts/* and resources/* were dispatched.
     } else {
       // A genuinely unknown METHOD is a protocol problem, so it keeps the
       // -32601 (method not found) code — distinct from an unknown tool, which
@@ -227,6 +266,87 @@ export class McpServer {
         this._sendError(req.id, -32601, 'Method not found');
       }
     }
+  }
+
+  /**
+   * Dispatches `prompts/*` and `resources/*` (#391).
+   *
+   * Split out of `_handleRequest` because these follow the same two-tier error
+   * contract as tools — an unknown prompt name or a malformed argument is an
+   * `isError: true` result the agent can read and act on, not a JSON-RPC error
+   * — and duplicating that in the main if-chain is how the tiers drift apart.
+   *
+   * @param {object} req
+   * @returns {Promise<boolean>} true when the method was handled here
+   */
+  async _handleSemantic(req) {
+    const { method, id, params } = req;
+    if (!method.startsWith('prompts/') && !method.startsWith('resources/')) return false;
+
+    // A capability that is not advertised must not be answered as if it worked.
+    // These fall through to -32601, which tells the client to re-read
+    // `initialize` rather than to retry.
+    if (method.startsWith('prompts/') && !this.promptsEnabled) return false;
+    if (method.startsWith('resources/') && !this.resourcesEnabled) return false;
+
+    const args = params?.arguments ?? {};
+    try {
+      let result;
+      if (method === 'prompts/list') {
+        result = listPrompts();
+      } else if (method === 'prompts/get') {
+        result = getPrompt(params?.name, args);
+      } else if (method === 'resources/list') {
+        result = listResources();
+      } else if (method === 'resources/templates/list') {
+        result = listResourceTemplates();
+      } else if (method === 'resources/read') {
+        result = await readResource(params?.uri, {
+          fetchDiscovery: this.fetchDiscovery,
+        });
+      } else {
+        return false; // a prompts/ or resources/ method we do not implement
+      }
+      // #198 applies here too: a frame with no id is a notification and is never
+      // answered, not even with a result. The work is still done so a malformed
+      // argument is logged rather than silently accepted.
+      if (id !== undefined) this._sendResult(id, result);
+      return true;
+    } catch (err) {
+      this._sendSemanticError(id, err);
+      return true;
+    }
+  }
+
+  /**
+   * Reports a prompts/resources failure in the right tier.
+   *
+   * A bad argument is a tool error (`isError: true` result), matching the
+   * documented contract. An unexpected throw stays a -32603, so a bug here is
+   * never mistaken for a caller mistake.
+   *
+   * @param {unknown} id
+   * @param {Error & {isToolError?: boolean, payload?: unknown}} err
+   */
+  _sendSemanticError(id, err) {
+    if (id === undefined) {
+      // #198: a notification is never answered, not even with an error.
+      this.logger.error?.(`mcp: notification failed: ${err?.message ?? err}`);
+      return;
+    }
+    if (err instanceof McpInputError || err?.isToolError) {
+      this._sendResult(id, {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(err.payload || { message: err.message }, null, 2),
+          },
+        ],
+        isError: true,
+      });
+      return;
+    }
+    this._sendError(id, -32603, err && err.message ? err.message : String(err));
   }
 
   _sendResult(id, result) {

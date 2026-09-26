@@ -1,3 +1,18 @@
+/**
+ * MCP CLI integration test — the spending guard, end to end.
+ *
+ * Unlike `mcp.test.js`'s sibling `mcp-server.test.js`, which drives
+ * `McpServer._handleRequest` in-process, this file spawns the real
+ * `src/mcp/cli.js` as a child process and speaks line-delimited JSON-RPC over
+ * its stdin/stdout. That is deliberate: the spending guard is the last line of
+ * defence between an agent and real money, and the only way to be sure it fires
+ * is to exercise the whole path the agent actually uses — process start, stdio
+ * framing, `tools/call`, and the guard itself.
+ *
+ * The protocol-level contract (framing, batching, error tiers) is covered in
+ * `mcp-server.test.js` and `mcp-transport.test.js`; this file is only about
+ * spending limits, so it stays deliberately small.
+ */
 import test from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
@@ -6,16 +21,35 @@ import path from 'node:path';
 
 const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/mcp/cli.js');
 
+/**
+ * Spawns the MCP CLI and returns a minimal JSON-RPC client for it.
+ *
+ * The client is deliberately hand-rolled rather than reusing a transport
+ * helper: it only needs one method, and keeping it inline means the test
+ * documents the wire format it depends on. Frames are newline-delimited (one
+ * JSON object per line), which is what `src/mcp/server.js` emits.
+ *
+ * @param {Record<string, string>} env - environment overrides for the child
+ * @returns {{callTool: (name: string, args: object) => Promise<object>, close: () => void}}
+ */
 function createMcpClient(env) {
   const child = spawn(process.execPath, [CLI_PATH], {
     env: { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // The CLI logs to stderr; surface it so a failure here is diagnosable from
+  // the test output rather than showing up as a bare timeout.
   child.stderr.on('data', d => process.stderr.write(d));
 
+  // Monotonic request ids. The server echoes them, so a response can be matched
+  // to its request without ordering assumptions.
   let messageId = 1;
+  /** @type {Map<number, {resolve: Function, reject: Function}>} */
   const pending = new Map();
 
+  // The child writes in chunks that do not align with line boundaries, so a
+  // partial trailing line is held in `buffer` until its newline arrives. Without
+  // this, a large response is parsed as truncated JSON and dropped.
   let buffer = '';
   child.stdout.on('data', chunk => {
     buffer += chunk.toString();
@@ -30,7 +64,14 @@ function createMcpClient(env) {
           const { resolve, reject } = pending.get(msg.id);
           pending.delete(msg.id);
           if (msg.error) {
+            // A protocol-level failure (-32603, unknown tool, and so on).
             reject(new Error(msg.error.message));
+          } else if (msg.result?.isError) {
+            // A tool-level refusal — the spending guard fires this way. Both
+            // tiers are rejections from the caller's point of view: this test
+            // asserts on the refusal message, not on the wrapper.
+            const text = msg.result.content?.[0]?.text;
+            reject(new Error(typeof text === 'string' ? text : JSON.stringify(msg.result)));
           } else {
             resolve(msg.result);
           }
@@ -41,6 +82,8 @@ function createMcpClient(env) {
     }
   });
 
+  // A child that exits with requests still in flight must not leave the test
+  // hanging until the runner's timeout: fail the pending calls immediately.
   child.on('exit', code => {
     for (const { reject } of pending.values()) {
       reject(new Error(`Child exited with code ${code}`));
@@ -75,12 +118,14 @@ test('MCP Server Spending Controls', async t => {
     MAX_SESSION_SPEND_STROOPS: '1000',
   });
 
-  // Since we don't have a real HTTP endpoint to hit in this unit test that returns 402,
-  // we will rely on the fact that if it exceeds limits, it throws immediately before fetching,
-  // or after fetching when reading 402 requirements.
-  // Wait, the MCP server performs a fetch first (Unpaid). If the mock endpoint doesn't exist, it will throw fetch error.
-  // We can mock an HTTP server to return a 402 with specific price.
-
+  // A real 402 is required, not a mock return value: `call_paid_resource` reads
+  // the price out of the challenge body, so the guard only has something to
+  // compare against if the endpoint answers with a genuine 402. A stub that
+  // returned a fixed price would let the cap logic pass while the real parsing
+  // path was broken.
+  //
+  // The per-call cap is 500 stroops and the session cap is 1000, so a 600-stroop
+  // resource must be refused by the per-call cap. That is the assertion below.
   const http = await import('node:http');
   const server = http.createServer((req, res) => {
     if (req.url === '/test-200-stroops') {
@@ -131,16 +176,19 @@ test('MCP Server Spending Controls', async t => {
 
   await t.test('enforces per-call cap (600 > 500)', async () => {
     try {
-      console.log('Sending call_paid_resource...');
       await client.callTool('call_paid_resource', { url: url600 });
-      console.log('Received response from call_paid_resource, failing test');
+      // Reaching here means the guard let an over-cap payment through — the
+      // failure mode this whole file exists to prevent.
       assert.fail('Should have rejected');
     } catch (err) {
-      console.log('Caught error:', err.message);
       assert.match(err.message, /Spending refused.*exceeds per-call limit/);
     }
   });
 
+  // Teardown in reverse dependency order, and unconditionally: `closeAllConnections`
+  // before `close` so `server.close()` can complete its handshake instead of
+  // waiting on a keep-alive socket, and the child killed last so it cannot
+  // outlive the fixture and hold the runner open.
   server.closeAllConnections();
   server.close();
   client.close();

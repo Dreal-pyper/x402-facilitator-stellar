@@ -239,6 +239,13 @@ export async function createApp(
   // set, server.js runs a separate listener for it and passes serveMetrics:false.
   const serveMetrics = extras.serveMetrics !== false;
 
+  // #392: the catalog search cache is an optional decorator around the store,
+  // so the metrics registry is attached here — app.js owns the registry, and
+  // server.js (which builds the cache) does not. No-ops on a plain store.
+  if (typeof catalog?.searchCache?.onLookup !== 'undefined') {
+    catalog.searchCache.onLookup = lookup => metrics.incCatalogCacheLookup(lookup);
+  }
+
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -595,6 +602,11 @@ export async function createApp(
                 validation.resource.toolName ?? null,
               );
               await catalog.upsertResource(validation.resource, source);
+              // Tell the search cache the catalog moved (#392). The local
+              // version bump already makes stale entries unreachable; this
+              // publishes so *other* replicas drop their L1 now instead of on
+              // their next miss. Best-effort and never on the payment path.
+              await catalog.searchCache?.invalidate({ reason: `cataloging:${source}` });
               // A public listing being created or overwritten is public state
               // changing — recorded so a spoofed listing can be investigated
               // after the fact.
@@ -1407,6 +1419,11 @@ export async function createApp(
           validation.resource.toolName ?? null,
         );
         const entry = await catalog.upsertResource(validation.resource, 'manual');
+        // Announce the write so peer replicas drop their cached searches (#392).
+        // The local replica is already correct — the write bumped the version
+        // that keys the cache — but without this broadcast the other replicas
+        // would keep serving the previous generation until their TTL expires.
+        await catalog.searchCache?.invalidate({ reason: 'cataloging:manual' });
         audit('catalog_write', {
           actor: req.keyId ?? `ip:${req.ip}`,
           source: 'manual',
