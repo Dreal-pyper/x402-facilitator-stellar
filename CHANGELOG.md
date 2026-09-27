@@ -57,31 +57,15 @@ pinned.
 - `server.js` now installs `unhandledRejection` / `uncaughtException` handlers
   and reports a listen or metrics-listener bind failure, exiting non-zero with
   a diagnostic instead of dying silently (#205).
-- Invisible characters are stripped from MCP text before ANSI escape sequences,
-  not after. The escape byte is itself a C0 control, so stripping controls first
-  removed the escape on its own and left the `[31m` body behind as visible text —
-  an escape sequence surviving in pieces. The whole sequence is now matched and
-  removed as one unit (#391).
-- The catalog search cache key now includes every filter `CatalogStore.search()`
-  supports. `type`, `payTo`, `scheme`, `network` and `offset` were missing, so
-  two searches differing only in those shared one entry — a caller filtering on
-  `network=stellar:pubnet` could be served a result set cached for
-  `network=stellar:testnet`, and `offset` could serve the same page twice. A
-  guard test derives its cases from the store's own filter list, so a filter
-  added there without being added here fails the suite (#392).
-- A manual `POST /discovery/resources` now broadcasts a cache invalidation like
-  the cataloging that follows a payment already did. The writing replica was
-  always correct, but peers kept serving the previous generation until their TTL
-  expired (#392).
-- The MCP integration test's JSON-RPC client now also rejects on an
-  `isError: true` result rather than only on a JSON-RPC `error`, so a tool-level
-  refusal cannot be mistaken for a successful call (#387).
-
-### Documentation
-
-- `test/mcp.test.js` now explains what it covers and why it spawns the CLI rather
-  than driving the server in-process, and the stray debug logging and
-  thinking-out-loud comments in it are gone (#387).
+- A facilitator throwing a non-Error value (an object, a number) no longer
+  surfaces `[object Object]` as `invalidMessage`/`errorMessage`: objects are
+  JSON-stringified so their content reaches the client, while Error messages
+  and strings pass through unchanged (#369).
+- The `EXTENSION-RESPONSES` header on catalogable payments is now encoded
+  lazily, when the response is actually serialized, instead of eagerly on
+  every verify/settle. The bytes a bazaar client receives are unchanged
+  (pinned byte-for-byte by tests); callers that never read the header no
+  longer pay the JSON+base64 cost per payment (#368).
 
 ## [0.0.1] - 2026-08-11
 
