@@ -634,19 +634,111 @@ test('MCP #391: an unimplemented prompts/ or resources/ method is method-not-fou
 });
 
 test('MCP #391: an unexpected failure inside a resource read stays an internal error', async () => {
-  const { server, sent } = makeSemanticServer({
-    fetchDiscovery: async () => {
-      throw new Error('facilitator exploded');
-    },
-  });
-  await server._handleRequest({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'resources/read',
-    params: { uri: 'x402://catalog/resources' },
-  });
+   const { server, sent } = makeSemanticServer({
+     fetchDiscovery: async () => {
+       throw new Error('facilitator exploded');
+     },
+   });
+   await server._handleRequest({
+     jsonrpc: '2.0',
+     id: 1,
+     method: 'resources/read',
+     params: { uri: 'x402://catalog/resources' },
+   });
 
-  const { error } = sent[0];
-  assert.equal(error.code, -32603, 'a bug must not be laundered into a caller error');
-  assert.equal(error.message, 'facilitator exploded');
-});
+   const { error } = sent[0];
+   assert.equal(error.code, -32603, 'a bug must not be laundered into a caller error');
+   assert.equal(error.message, 'facilitator exploded');
+ });
+
+// ---------------------------------------------------------------------------
+// SSE transport (#391)
+// ---------------------------------------------------------------------------
+
+test('MCP #391: SSE transport starts and serves prompts and resources', async () => {
+   const server = new McpServer({ name: 'sse-test', version: '0.0.1' });
+   server.tool('echo', { description: 'echo an argument', properties: { value: { type: 'string' } } }, async args => args);
+
+   const { port, close } = await server.startSSE({ port: 0 });
+
+   // Fetch the initialize endpoint via POST to /mcp
+   const initRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+   });
+   const body = await initRes.json();
+   assert.ok(body.result, 'initialize must return a result');
+   assert.ok(body.result.capabilities, 'initialize must advertise capabilities');
+
+   await close();
+ });
+
+test('MCP #391: SSE transport advertises prompts and resources capabilities', async () => {
+   const server = new McpServer({ name: 'sse-capabilities', version: '0.0.1', prompts: true, resources: true, fetchDiscovery: async () => ({ resources: [] }) });
+   server.tool('echo', { description: 'echo', properties: { value: { type: 'string' } } }, async args => args);
+
+   const { port, close } = await server.startSSE({ port: 0 });
+
+   const initRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+   });
+   const body = await initRes.json();
+   const caps = body.result.capabilities;
+   assert.deepEqual(Object.keys(caps).sort(), ['prompts', 'resources', 'tools'], 'must advertise all three capabilities');
+
+   // Test prompts/list
+   const promptsRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'prompts/list', params: {} }),
+   });
+   const promptsBody = await promptsRes.json();
+   assert.ok(promptsBody.result.prompts, 'must have prompts');
+   assert.equal(promptsBody.result.prompts.length, 3, 'must have three prompt templates');
+
+   // Test resources/list
+   const resListRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} }),
+   });
+   const resListBody = await resListRes.json();
+   assert.ok(resListBody.result.resources, 'must have resources');
+
+   await close();
+ });
+
+test('MCP #391: SSE transport rejects JSON-RPC batches', async () => {
+   const server = new McpServer({ name: 'sse-batch', version: '0.0.1' });
+
+   const { port, close } = await server.startSSE({ port: 0 });
+
+   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'ping' }]),
+   });
+   const body = await res.json();
+   assert.equal(body.error.code, -32600, 'batches must be rejected with -32600');
+
+   await close();
+ });
+
+test('MCP #391: SSE transport returns -32601 for unknown methods', async () => {
+   const server = new McpServer({ name: 'sse-unknown', version: '0.0.1' });
+
+   const { port, close } = await server.startSSE({ port: 0 });
+
+   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'nonsense/method' }),
+   });
+   const body = await res.json();
+   assert.equal(body.error.code, -32601, 'unknown method must be -32601');
+
+   await close();
+ });

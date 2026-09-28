@@ -2,6 +2,8 @@ import { createInterface } from 'readline';
 import { getPrompt, listPrompts } from './prompts.js';
 import { McpInputError } from './sanitize.js';
 import { listResourceTemplates, listResources, readResource } from './resources.js';
+import { createServer } from 'node:http';
+import { EventEmitter } from 'node:events';
 
 /**
  * Minimal MCP Stdio Server.
@@ -133,6 +135,103 @@ export class McpServer {
     this._open = false;
     this._releaseAll();
     this._rl?.close();
+  }
+
+  /**
+   * Starts an SSE-based HTTP server for MCP transport (#391).
+   *
+   * Accepts JSON-RPC POST requests at `/mcp` and returns responses
+   * as JSON-RPC over HTTP POST. This enables browser-based and HTTP-client
+   * MCP integrations alongside the stdio transport.
+   *
+   * @param {object} options
+   * @param {number} [options.port=0] - port to listen on (0 = auto-assign)
+   * @param {string} [options.host='127.0.0.1'] - host to bind
+   * @returns {Promise<{server: object, port: number, close: () => Promise<void>}>}
+   */
+  async startSSE({ port = 0, host = '127.0.0.1' } = {}) {
+    const server = createServer(async (req, res) => {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        });
+        res.end();
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/mcp') {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+
+        let reqObj;
+        try {
+          reqObj = JSON.parse(body);
+        } catch {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+          return;
+        }
+
+        if (Array.isArray(reqObj)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'JSON-RPC batch requests are not supported' } }));
+          return;
+        }
+
+        const id = reqObj.id;
+        // Override _write to capture responses and send them as JSON-RPC.
+        const originalStdout = this._stdout;
+        const captured = [];
+        this._open = true;
+        this._stdout = { write: (chunk) => captured.push(chunk.toString()), on: () => {}, off: () => {} };
+        try {
+          await this._handleRequest(reqObj);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          for (const chunk of captured) res.write(chunk);
+          res.end();
+        } catch (err) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message: err.message } }));
+        } finally {
+          this._stdout = originalStdout;
+          this._open = false;
+        }
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+
+    this._sseServer = server;
+    return new Promise((resolve) => {
+      server.listen(port, host, () => {
+        const addr = server.address();
+        resolve({ server, port: addr.port, close: async () => { await server.close(); } });
+      });
+    });
+  }
+
+  /**
+   * Sends an SSE event to the connected client.
+   *
+   * @param {object} res - the HTTP response object
+   * @param {object} msg - the JSON-RPC message to send as an SSE event
+   */
+  _sendSSE(res, msg) {
+    const data = JSON.stringify(msg);
+    res.write(`data: ${data}\n\n`);
+  }
+
+  /**
+   * Stops the SSE HTTP server if one was started.
+   */
+  async stopSSE() {
+    if (this._sseServer) {
+      await new Promise(r => this._sseServer.close(r));
+      this._sseServer = null;
+    }
   }
 
   async _processLine(line) {

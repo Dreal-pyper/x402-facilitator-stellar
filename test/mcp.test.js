@@ -1,7 +1,7 @@
 /**
  * MCP CLI integration test — the spending guard, end to end.
  *
- * Unlike `mcp.test.js`'s sibling `mcp-server.test.js`, which drives
+ * Unlike {@link ../test/mcp-server.test.js | `mcp-server.test.js`}, which drives
  * `McpServer._handleRequest` in-process, this file spawns the real
  * `src/mcp/cli.js` as a child process and speaks line-delimited JSON-RPC over
  * its stdin/stdout. That is deliberate: the spending guard is the last line of
@@ -10,8 +10,13 @@
  * framing, `tools/call`, and the guard itself.
  *
  * The protocol-level contract (framing, batching, error tiers) is covered in
- * `mcp-server.test.js` and `mcp-transport.test.js`; this file is only about
- * spending limits, so it stays deliberately small.
+ * {@link ../test/mcp-server.test.js | `mcp-server.test.js`} and
+ * {@link ../test/mcp-transport.test.js | `mcp-transport.test.js`};
+ * this file is only about spending limits, so it stays deliberately small.
+ *
+ * @module mcp-cli-integration-test
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/server.js | MCP Server}
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI}
  */
 import test from 'node:test';
 import assert from 'node:assert';
@@ -19,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+/** Absolute path to the MCP CLI entry point for child-process spawning. */
 const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/mcp/cli.js');
 
 /**
@@ -29,8 +35,29 @@ const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src
  * documents the wire format it depends on. Frames are newline-delimited (one
  * JSON object per line), which is what `src/mcp/server.js` emits.
  *
- * @param {Record<string, string>} env - environment overrides for the child
- * @returns {{callTool: (name: string, args: object) => Promise<object>, close: () => void}}
+ * The child process inherits the provided environment variables so the CLI
+ * can be configured without affecting the parent process. The stderr stream
+ * is piped back to the parent so diagnostic output from the CLI is visible
+ * on test failure.
+ *
+ * Message framing uses a line-buffered approach: the child writes chunks
+ * that do not align with JSON object boundaries, so a partial trailing line
+ * is held in `buffer` until its newline arrives. Without this, a large
+ * response would be parsed as truncated JSON and dropped.
+ *
+ * Pending responses are tracked by monotonic integer IDs, matching the
+ * request/response IDs emitted by `src/mcp/server.js`. A child exit with
+ * requests still in flight immediately rejects all pending calls rather than
+ * hanging until the runner's timeout.
+ *
+ * @param {Record<string, string>} env - environment overrides injected into the child process
+ * @returns {{callTool: (name: string, args: object) => Promise<object>, close: () => void}} An object with a `callTool` method to dispatch JSON-RPC requests and a `close` method to terminate the child process.
+ * @throws {Error} If the child process exits with a non-zero code while requests are pending.
+ *
+ * @example
+ * const client = createMcpClient({ AGENT_PAYER_SECRET_KEY: '...' });
+ * const result = await client.callTool('call_paid_resource', { url: 'https://...' });
+ * client.close();
  */
 function createMcpClient(env) {
   const child = spawn(process.execPath, [CLI_PATH], {
@@ -92,6 +119,13 @@ function createMcpClient(env) {
   });
 
   return {
+    /**
+     * Dispatch a JSON-RPC `tools/call` request to the MCP CLI child process.
+     *
+     * @param {string} name - the tool name to call
+     * @param {object} args - the tool arguments
+     * @returns {Promise<object>} the resolved result from the server
+     */
     callTool: (name, args) => {
       return new Promise((resolve, reject) => {
         const id = messageId++;
@@ -105,13 +139,35 @@ function createMcpClient(env) {
         child.stdin.write(req + '\n');
       });
     },
+    /** Terminate the child process. */
     close: () => {
       child.kill();
     },
   };
 }
 
+/**
+ * Spending control integration test.
+ *
+ * Verifies that the `call_paid_resource` tool enforces per-call and session
+ * spending caps. A real HTTP 402 challenge is required because the tool reads
+ * the price out of the challenge body — a stub that returned a fixed price
+ * would let the cap logic pass while the real parsing path was broken.
+ *
+ * Test setup:
+ * - Per-call cap: 500 stroops
+ * - Session cap: 1000 stroops
+ * - Test resource: 600 stroops (exceeds the per-call cap)
+ *
+ * The test asserts that the 600-stroop resource is refused by the per-call cap.
+ * After each test, teardown runs in reverse dependency order to ensure clean
+ * shutdown: closeConnections before close so server.close() can complete its
+ * handshake, and the child is killed last so it cannot outlive the fixture.
+ *
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI spending guard}
+ */
 test('MCP Server Spending Controls', async t => {
+  /** @type {ReturnType<typeof createMcpClient>} */
   const client = createMcpClient({
     AGENT_PAYER_SECRET_KEY: 'SBTJBX7IF3W4IU2VRQXK2PPEAQJW5PZTRUQPL4CVIBEL42OE3YLETWWW', // valid testnet key
     MAX_FEE_PER_CALL_STROOPS: '500',
@@ -129,41 +185,11 @@ test('MCP Server Spending Controls', async t => {
   const http = await import('node:http');
   const server = http.createServer((req, res) => {
     if (req.url === '/test-200-stroops') {
-      res.writeHead(402, {
-        'Content-Type': 'application/json',
-      });
-      res.end(
-        JSON.stringify({
-          error: 'payment_required',
-          x402Version: 1,
-          accepts: [
-            {
-              scheme: 'exact',
-              network: 'stellar:testnet',
-              price: { asset: 'native', amount: '200' },
-              payTo: 'GBQ...',
-            },
-          ],
-        }),
-      );
+      res.writeHead(402, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'payment_required', x402Version: 1, accepts: [{ scheme: 'exact', network: 'stellar:testnet', price: { asset: 'native', amount: '200' }, payTo: 'GBQ...' }] }));
     } else if (req.url === '/test-600-stroops') {
-      res.writeHead(402, {
-        'Content-Type': 'application/json',
-      });
-      res.end(
-        JSON.stringify({
-          error: 'payment_required',
-          x402Version: 1,
-          accepts: [
-            {
-              scheme: 'exact',
-              network: 'stellar:testnet',
-              price: { asset: 'native', amount: '600' },
-              payTo: 'GBQ...',
-            },
-          ],
-        }),
-      );
+      res.writeHead(402, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'payment_required', x402Version: 1, accepts: [{ scheme: 'exact', network: 'stellar:testnet', price: { asset: 'native', amount: '600' }, payTo: 'GBQ...' }] }));
     } else {
       res.writeHead(404);
       res.end();
@@ -174,6 +200,15 @@ test('MCP Server Spending Controls', async t => {
   const port = server.address().port;
   const url600 = `http://localhost:${port}/test-600-stroops`;
 
+  /**
+   * Enforces the per-call cap: a 600-stroop resource must be refused when the
+   * cap is 500 stroops. This is the core assertion of the spending guard.
+   *
+   * The guard should reject the request and the error message must contain
+   * "Spending refused" and "exceeds per-call limit".
+   *
+   * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | Spending guard logic}
+   */
   await t.test('enforces per-call cap (600 > 500)', async () => {
     try {
       await client.callTool('call_paid_resource', { url: url600 });
