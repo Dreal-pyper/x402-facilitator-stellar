@@ -3,7 +3,6 @@ import { getPrompt, listPrompts } from './prompts.js';
 import { McpInputError } from './sanitize.js';
 import { listResourceTemplates, listResources, readResource } from './resources.js';
 import { createServer } from 'node:http';
-import { EventEmitter } from 'node:events';
 
 /**
  * Protocol revisions this server will negotiate, oldest first (#169).
@@ -190,13 +189,25 @@ export class McpServer {
           reqObj = JSON.parse(body);
         } catch {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: 'Parse error' },
+            }),
+          );
           return;
         }
 
         if (Array.isArray(reqObj)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'JSON-RPC batch requests are not supported' } }));
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32600, message: 'JSON-RPC batch requests are not supported' },
+            }),
+          );
           return;
         }
 
@@ -205,7 +216,11 @@ export class McpServer {
         const originalStdout = this._stdout;
         const captured = [];
         this._open = true;
-        this._stdout = { write: (chunk) => captured.push(chunk.toString()), on: () => {}, off: () => {} };
+        this._stdout = {
+          write: chunk => captured.push(chunk.toString()),
+          on: () => {},
+          off: () => {},
+        };
         try {
           await this._handleRequest(reqObj);
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -213,7 +228,9 @@ export class McpServer {
           res.end();
         } catch (err) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message: err.message } }));
+          res.end(
+            JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message: err.message } }),
+          );
         } finally {
           this._stdout = originalStdout;
           this._open = false;
@@ -225,10 +242,16 @@ export class McpServer {
     });
 
     this._sseServer = server;
-    return new Promise((resolve) => {
+    return new Promise(resolve => {
       server.listen(port, host, () => {
         const addr = server.address();
-        resolve({ server, port: addr.port, close: async () => { await server.close(); } });
+        resolve({
+          server,
+          port: addr.port,
+          close: async () => {
+            await server.close();
+          },
+        });
       });
     });
   }
@@ -300,6 +323,23 @@ export class McpServer {
     }
   }
 
+  /**
+   * The capability set advertised by `initialize` (#391).
+   *
+   * Mirrors the gates in `_handleSemantic` exactly: a client that reads
+   * `prompts` or `resources` here expects those methods to be answered, so the
+   * two must never diverge. `resources` is withheld unless there is a
+   * facilitator endpoint to resolve `x402://catalog/...` URIs against.
+   *
+   * @returns {{tools: object, prompts?: object, resources?: object}}
+   */
+  _capabilities() {
+    const capabilities = { tools: {} };
+    if (this.promptsEnabled) capabilities.prompts = {};
+    if (this.resourcesEnabled) capabilities.resources = {};
+    return capabilities;
+  }
+
   async _handleRequest(req) {
     if (req.method === 'initialize') {
       // #169: negotiate rather than hardcode. The client names the revision it
@@ -319,7 +359,7 @@ export class McpServer {
       this._sendResult(req.id, {
         protocolVersion: agreed ?? LATEST_PROTOCOL_VERSION,
         serverInfo: { name: this.name, version: this.version },
-        capabilities,
+        capabilities: this._capabilities(),
       });
     } else if (req.method === 'tools/list') {
       const tools = Array.from(this.tools.entries()).map(([name, { schema }]) => ({

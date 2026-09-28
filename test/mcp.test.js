@@ -324,10 +324,36 @@ test('MCP Server Spending Controls', async t => {
   const server = http.createServer((req, res) => {
     if (req.url === '/test-200-stroops') {
       res.writeHead(402, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'payment_required', x402Version: 1, accepts: [{ scheme: 'exact', network: 'stellar:testnet', price: { asset: 'native', amount: '200' }, payTo: 'GBQ...' }] }));
+      res.end(
+        JSON.stringify({
+          error: 'payment_required',
+          x402Version: 1,
+          accepts: [
+            {
+              scheme: 'exact',
+              network: 'stellar:testnet',
+              price: { asset: 'native', amount: '200' },
+              payTo: 'GBQ...',
+            },
+          ],
+        }),
+      );
     } else if (req.url === '/test-600-stroops') {
       res.writeHead(402, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'payment_required', x402Version: 1, accepts: [{ scheme: 'exact', network: 'stellar:testnet', price: { asset: 'native', amount: '600' }, payTo: 'GBQ...' }] }));
+      res.end(
+        JSON.stringify({
+          error: 'payment_required',
+          x402Version: 1,
+          accepts: [
+            {
+              scheme: 'exact',
+              network: 'stellar:testnet',
+              price: { asset: 'native', amount: '600' },
+              payTo: 'GBQ...',
+            },
+          ],
+        }),
+      );
     } else {
       res.writeHead(404);
       res.end();

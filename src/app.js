@@ -256,6 +256,11 @@ export async function createApp(
                 validation.resource.toolName ?? null,
               );
               await catalog.upsertResource(validation.resource, source);
+              // Tell the search cache the catalog moved (#392). The local
+              // version bump already makes stale entries unreachable; this
+              // publishes so *other* replicas drop their L1 now instead of on
+              // their next miss. Best-effort and never on the payment path.
+              await catalog.searchCache?.invalidate({ reason: `cataloging:${source}` });
               audit('catalog_write', {
                 actor: req.keyId ?? `ip:${req.ip}`,
                 source,
