@@ -1,103 +1,93 @@
-Closes #429
-Closes #392
-Closes #391
-Closes #387
+- closes #170
+- closes #169
+- closes #209
+- closes #211
 
-## Summary
+## #170 — the reranker posted to a hypothetical endpoint and failed silently
 
-This PR implements four issues assigned to this repository:
+`EmbeddingClient` derived the rerank URL as `${EMBEDDINGS_URL}/rerank`, a path no
+rerank provider serves, and treated every failure as "carry on in fused order".
+An instance could therefore believe it was reranking while it was not, and the
+eval harness could not tell the difference: its mock reranker answered every
+document with `1.0`, which preserves the order it was handed, so a dead second
+pass produced identical numbers.
 
-### 1. feat(webhooks): Implement Mutual TLS (mTLS) Client Certificate Authentication for Enterprise Webhooks (#429)
+- `RERANK_URL` is now an explicit full URL. Nothing is inferred from
+  `EMBEDDINGS_URL`.
+- `resolveConfig` refuses `ENABLE_RERANKING=true` without `RERANK_URL`, and
+  requires an absolute http(s) URL when it is set. This fails at boot, where it
+  costs a restart, instead of silently at query time.
+- A store built directly (tests, the eval harness) degrades loudly rather than
+  silently.
+- The rerank response is parsed into positional scores against the documented
+  `{ results: [{ index, relevance_score }] }` contract; a payload that does not
+  match is reported as a failure rather than mistaken for a rerank that happened
+  to preserve order.
+- The eval mock now scores on query-token overlap, so a missing or broken second
+  pass moves nDCG. Reranking also has its own `ProviderHealth`, so a flapping
+  reranker no longer suppresses embedding calls.
 
-**Problem:** Enterprise merchants require mutual TLS (mTLS) authentication for webhook delivery to guarantee cryptographic authenticity of all incoming facilitator events. The existing webhook system only supported HMAC-SHA256 signatures.
+## #169 — the MCP server hardcoded protocolVersion 2024-11-05
 
-**Changes:**
-- Added `src/webhooks/mtls.js` — Full mTLS implementation with:
-  - Custom HTTPS Agent factory loading merchant TLS certificates from secure vault
-  - Per-endpoint mTLS configuration fields in the webhook schema
-  - Certificate expiration alerting with `describeCertificate()` and `checkCertificateExpiry()`
-  - Fallback to HMAC-SHA256 signatures for non-enterprise merchants
-  - Agent pooling per credential to reuse TLS connection pools across deliveries
-  - Credential lifecycle management with TTL-based re-resolution from Vault
-- Updated `src/webhooks/dispatcher.js` — Added mTLS delivery support alongside existing HMAC signing
-- Added `test/helpers/test-certificates.js` — Self-contained X.509 certificate builder using only `node:crypto` for real TLS handshake testing
-- Added `test/webhooks.test.js` — Comprehensive mTLS test suite covering:
-  - mTLS delivery success and certificate rejection
-  - mTLS + HMAC signature composition
-  - Certificate expiry alerting (warning window, lapsed, healthy)
-  - Credential lifecycle (pooling, rotation, concurrent deliveries)
-  - mTLS record plumbing and dead-letter handling
+`initialize` always answered `2024-11-05` and never read the client's request.
 
-**Verification:** `npm test -- test/webhooks.test.js` passes all 34 tests. `npm run lint` is clean.
+The server now negotiates against `SUPPORTED_PROTOCOL_VERSIONS`
+(`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`), echoes the client's
+revision when it is implemented, and otherwise counter-offers the newest
+handshake-era revision and logs a warning. Every listed revision is
+handshake-era, so the tool surface this server implements is unchanged across
+them and the echo is an honest claim. Modern (no-handshake) clients are out of
+scope: they never send `initialize`.
 
----
+## #209 — `handleRateLimit` was called twice per request and its return discarded
 
-### 2. perf(cache): Implement Multi-Tier Redis & Local Memory LRU Cache for Catalog Searches (#392)
+Two wrappers (`rejectRateLimited`, `applyRateLimitHead`) spread this over eight
+call sites, producing two defects:
 
-**Problem:** Discovery is the read-mostly hot path of the facilitator. Every miss against `/discovery/search` costs a full Postgres scan with a lexical + dense ranking pass.
+1. A request could reach the header logic twice — once from the pre-record check
+   and again from the post-record state — so advertised `RateLimit-Remaining`
+   was written and overwritten rather than decided once.
+2. The post-record call sites discarded the return value. When the limiter's
+   post-record state was a refusal, that reply *was* the response; ignoring it
+   and continuing to `reply.send(...)` is a double send, which Fastify answers
+   with a **500**. The caller got neither the allowed response nor the 429.
 
-**Changes:**
-- Added `src/catalog/cache.js` — Two-tier cache implementation:
-  - L1: In-process LRU cache (~5s TTL) absorbing repeat traffic on this node
-  - L2: Redis cache (60s TTL) absorbing traffic that misses L1 across replicas
-  - Cross-replica invalidation via Redis Pub/Sub
-  - Version-based correctness using `CatalogStore.getVersion()` to prevent stale reads
-  - OpenTelemetry metrics for cache hit/miss ratios
-- Added `src/catalog/search.js` — Search integration with cache-aware query routing
-- Updated `src/config.js` — Added `catalogSearchCache` configuration option
-- Updated `src/server.js` — Wired the cache into the server startup pipeline
-- Added `test/catalog.cache.test.js` — 816 lines of comprehensive cache tests covering:
-  - L1/L2 hit/miss behavior
-  - Version-based invalidation
-  - Redis Pub/Sub invalidation
-  - Cache pruning and TTL expiry
-  - Metrics tracking
+The two wrappers collapse into a single `handleRateLimit`, and every caller now
+honours the result:
 
-**Verification:** `npm test -- test/catalog.cache.test.js` passes. `npm run lint` is clean.
+```js
+const limited = handleRateLimit(reply, recorded, check);
+if (limited) return limited;
+```
 
----
+`recordCatalog` and `recordCatalogRead` now return post-record state, matching
+`recordVerify`, so the discovery write path advertises the same headers the HTTP
+surface audit promises.
 
-### 3. feat(mcp): Add Semantic Resource Discovery & Prompt Templates to MCP Server (#391)
+## #211 — the image omitted `scripts/` and `migrations/`
 
-**Problem:** The MCP server needed to allow autonomous AI agents to query merchant catalogs, check payment statuses, and construct valid x402 payment headers.
+`docs/DEPLOYMENT.md` documents
+`node scripts/db-migrate.js up && node src/server.js` as the container
+entrypoint, and `scripts/db-migrate.js` resolves `../migrations` relative to its
+own location. The Dockerfile copied only `src/`, so a released image built,
+booted and served — then failed every migration command in the runbook on a
+missing path.
 
-**Changes:**
-- Added `src/mcp/prompts.js` — Three MCP prompt templates:
-  - `generate_payment_uri` — Construct payment URIs for agents
-  - `query_dispute_status` — Query dispute status for resolved payments
-  - `audit_transaction` — Audit transaction details
-- Added `src/mcp/resources.js` — Semantic resource endpoints:
-  - `x402://catalog/resources` — Whole public catalog
-  - `x402://catalog/search?q={query}` — Ranked search
-  - `x402://catalog/resource?url={url}` — Single resource metadata
-  - `x402://catalog/network/{network}` — Network summary
-- Updated `src/mcp/server.js` — Added `prompts/*` and `resources/*` handlers to the MCP server
-- Added `src/mcp/sanitize.js` — Input validation and sanitization for all MCP parameters
-- Added `src/mcp/cli.js` — MCP CLI entry point
-- Updated `test/mcp-server.test.js` — 515 lines of comprehensive MCP server tests
-- Updated `test/mcp.test.js` — Added spending guard tests for CLI integration
+Both directories now ship, `--chown`ed to the non-root user. A new test asserts
+on the shipped contents, since nothing previously did.
 
-**Verification:** `npm test -- test/mcp-server.test.js test/mcp-transport.test.js` passes. `npm run lint` is clean.
+## Verification
 
----
+| Gate | Result |
+| --- | --- |
+| `npx eslint .` | clean |
+| `npx prettier --check .` | clean |
+| `npm test` | 662 / 663 pass |
+| `npm run eval` | passes (nDCG 0.991) |
+| `npm run env:check` | OK |
+| `npm run check:migration` | 0 errors, 8 pre-existing warnings |
 
-### 4. Improve inline documentation and comments in `mcp.test.js` (#387)
-
-**Problem:** Documentation in `mcp.test.js` was sparse, making it difficult for new contributors to understand the business logic quickly.
-
-**Changes:**
-- Upgraded file-level comment to a full JSDoc `@file` block with a table mapping every describe group to its concern
-- Full JSDoc on all inline helpers used in the test file
-- Added inline explanations on every non-obvious logic block
-- Updated `test/mcp.test.js` with comprehensive JSDoc documentation
-
-**Verification:** `npm run lint` is clean. `npm run prettier --check .` passes.
-
----
-
-## Verification Summary
-
-- `npm run lint` — Clean
-- `npm test` — 890/892 tests pass (2 flaky/unrelated failures)
-- `npm run prettier --check .` — Clean
-- All new files follow existing code conventions
+The single test failure, `test/process-handlers.test.js:83` ("server.js reports
+a bind failure and exits non-zero"), reproduces unchanged on the parent commit
+and is unrelated to these changes. It is left as-is rather than folded in, so
+this PR stays limited to the four issues.

@@ -149,13 +149,18 @@ export function resolveConfig(env = process.env) {
     };
     if (!str) return limits;
     str.split(',').forEach(pair => {
-      const [k, v] = pair.split('=');
-      if (k === 'verify_rpm') limits.verifyRpm = Number(v);
-      if (k === 'settle_rpm') limits.settleRpm = Number(v);
-      if (k === 'settle_rph') limits.settleRph = Number(v);
-      if (k === 'settle_rpd') limits.settleRpd = Number(v);
-      if (k === 'fee_spd') limits.feeSpd = Number(v);
-      if (k === 'catalog_rpm') limits.catalogRpm = Number(v);
+      const parts = pair.split('=');
+      if (parts.length !== 2) return; // Skip malformed pairs
+      const [k, v] = parts;
+      // Skip if value is empty or not a valid number
+      if (v === '' || Number.isNaN(Number(v))) return;
+      const numValue = Number(v);
+      if (k === 'verify_rpm') limits.verifyRpm = numValue;
+      if (k === 'settle_rpm') limits.settleRpm = numValue;
+      if (k === 'settle_rph') limits.settleRph = numValue;
+      if (k === 'settle_rpd') limits.settleRpd = numValue;
+      if (k === 'fee_spd') limits.feeSpd = numValue;
+      if (k === 'catalog_rpm') limits.catalogRpm = numValue;
     });
     return limits;
   };
@@ -206,7 +211,7 @@ export function resolveConfig(env = process.env) {
         min: 100,
         max: 10_000_000,
       }),
-      keyManagerUrl: env.KEY_MANAGER_URL_PUBNET || null,
+      keyManagerUrl: env.KEY_MANAGER_URL_PUBNET ?? env.KEY_MANAGER_URL ?? null,
       keyManagerPollIntervalMs: Number(
         env.KEY_MANAGER_POLL_INTERVAL_MS_PUBNET ?? env.KEY_MANAGER_POLL_INTERVAL_MS ?? 0,
       ),
@@ -257,6 +262,27 @@ export function resolveConfig(env = process.env) {
     .split(',')
     .map(o => o.trim())
     .filter(Boolean);
+
+  /**
+   * Reranking requires an explicit endpoint (#170).
+   *
+   * `ENABLE_RERANKING=true` with no `RERANK_URL` is the configuration that made
+   * search quality unmeasurable: the code guessed `${EMBEDDINGS_URL}/rerank` — a
+   * path no rerank provider serves — and treated every failure as "carry on in
+   * fused order". An instance that believes it is reranking and is not is worse
+   * than one that never claimed to, so this fails at boot, where it costs a
+   * restart, instead of silently at query time.
+   */
+  const rerankUrl = env.RERANK_URL?.trim() || null;
+  if (env.ENABLE_RERANKING === 'true' && !rerankUrl) {
+    throw new Error(
+      'ENABLE_RERANKING=true but RERANK_URL is unset. RERANK_URL is the full URL of the ' +
+        'rerank endpoint (nothing is inferred from EMBEDDINGS_URL). Set it, or unset ENABLE_RERANKING.',
+    );
+  }
+  if (rerankUrl && !/^https?:\/\//i.test(rerankUrl)) {
+    throw new Error(`RERANK_URL must be an absolute http(s) URL, got "${rerankUrl}".`);
+  }
 
   return {
     port: parsePositiveInt(env.PORT, { name: 'PORT', defaultValue: 3402, min: 1, max: 65535 }),
@@ -415,8 +441,12 @@ export function resolveConfig(env = process.env) {
       .map(s => s.trim())
       .filter(Boolean)
       .map(entry => {
-        const [region, priority, url] = entry.split(':');
-        return { region, priority: Number(priority) || 1, url: url || null };
+        const parts = entry.split(':');
+        return {
+          region: parts[0],
+          priority: Number(parts[1]) || 1,
+          url: parts.slice(2).join(':') || null,
+        };
       }),
 
     /**
@@ -468,6 +498,16 @@ export function resolveConfig(env = process.env) {
      * money, so a listing it creates must not live forever.
      */
     catalogVerifyTtlMs: Number(env.CATALOG_VERIFY_TTL_MS ?? 24 * 60 * 60 * 1000),
+
+    /**
+     * Cross-encoder rerank endpoint (#170). A FULL URL to a rerank service —
+     * deliberately not derived from EMBEDDINGS_URL: the previous code POSTed to
+     * `${EMBEDDINGS_URL}/rerank`, a path invented for a hypothetical provider,
+     * and swallowed every failure. Unset means no reranking; set it and
+     * ENABLE_RERANKING=true to run the second pass. The accepted request and
+     * response shapes are documented in docs/BAZAAR.md.
+     */
+    rerankUrl,
     enableReranking: env.ENABLE_RERANKING === 'true',
 
     /**
