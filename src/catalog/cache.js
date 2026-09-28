@@ -123,6 +123,12 @@ export class LruTtlCache {
  * that, the L1's 5-second window is also a 5-second stampede window: every
  * replica's L1 expires together, every agent request in flight re-queries, and
  * the database sees a spike that the cache was supposed to remove.
+ *
+ * Cache lookup metrics (#392): `onLookup` receives tier/outcome events for
+ * each cache operation, enabling OpenTelemetry counters for hit/miss/error
+ * ratios per tier. When an `incCatalogCacheLookup` function is passed as
+ * `onLookup`, lookups are reported to the Prometheus metrics pipeline.
+ * The `withSearchCache` wrapper passes this through automatically.
  */
 export class CatalogSearchCache {
   /**
